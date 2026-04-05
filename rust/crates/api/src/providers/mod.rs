@@ -173,9 +173,9 @@ pub fn resolve_model_alias(model: &str) -> String {
                 },
                 ProviderKind::OpenAi => trimmed,
                 ProviderKind::GithubCopilot => match *alias {
-                    "copilot-opus" => "anthropic/claude-opus-4-6",
-                    "copilot-sonnet" => "anthropic/claude-sonnet-4-6",
-                    "copilot-haiku" => "anthropic/claude-haiku-4-5-20251213",
+                    "copilot-opus" => "claude-opus-4.6",
+                    "copilot-sonnet" => "claude-sonnet-4.6",
+                    "copilot-haiku" => "claude-haiku-4.5",
                     _ => trimmed,
                 },
             })
@@ -227,7 +227,7 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
         return ProviderKind::Xai;
     }
     if openai_compat::has_api_key("GITHUB_COPILOT_API_KEY")
-        || openai_compat::has_api_key("GITHUB_TOKEN")
+        || openai_compat::has_api_key("GITHUB_COPILOT_TOKEN")
     {
         return ProviderKind::GithubCopilot;
     }
@@ -252,17 +252,13 @@ pub fn max_tokens_for_model(model: &str) -> u32 {
 #[must_use]
 pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
     let canonical = resolve_model_alias(model);
-    // Strip vendor prefix (e.g. "anthropic/claude-opus-4-6" -> "claude-opus-4-6")
-    // so GitHub Copilot aliases match the same token limits.
-    let bare = canonical
-        .rsplit_once('/')
-        .map_or(canonical.as_str(), |(_, name)| name);
-    match bare {
-        "claude-opus-4-6" => Some(ModelTokenLimit {
+    match canonical.as_str() {
+        "claude-opus-4-6" | "claude-opus-4.6" | "claude-opus-4.5" => Some(ModelTokenLimit {
             max_output_tokens: 32_000,
             context_window_tokens: 200_000,
         }),
-        "claude-sonnet-4-6" | "claude-haiku-4-5-20251213" => Some(ModelTokenLimit {
+        "claude-sonnet-4-6" | "claude-sonnet-4.6" | "claude-sonnet-4.5"
+        | "claude-haiku-4-5-20251213" | "claude-haiku-4.5" => Some(ModelTokenLimit {
             max_output_tokens: 64_000,
             context_window_tokens: 200_000,
         }),

@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::sync::Mutex;
 
 use crate::error::ApiError;
 use crate::types::{
@@ -16,12 +18,164 @@ use super::{preflight_message_request, Provider, ProviderFuture};
 
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
-pub const DEFAULT_GITHUB_COPILOT_BASE_URL: &str = "https://models.github.ai/inference";
+pub const DEFAULT_GITHUB_COPILOT_BASE_URL: &str = "https://api.githubcopilot.com";
+const GITHUB_COPILOT_APPS_JSON: &str = ".config/github-copilot/apps.json";
+const GITHUB_COPILOT_HOSTS_JSON: &str = ".config/github-copilot/hosts.json";
+const GITHUB_COPILOT_TOKEN_URL: &str = "https://api.github.com/copilot_internal/v2/token";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
 const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(2);
 const DEFAULT_MAX_RETRIES: u32 = 2;
+
+/// Manages short-lived Copilot session tokens obtained by exchanging a GitHub
+/// OAuth token (from VS Code / `~/.config/github-copilot/apps.json`) with the
+/// Copilot internal token endpoint.  Tokens are cached and automatically
+/// refreshed when they expire.
+#[derive(Debug, Clone)]
+pub struct CopilotTokenManager {
+    github_token: String,
+    http: reqwest::Client,
+    cached: Arc<Mutex<Option<CopilotCachedToken>>>,
+}
+
+#[derive(Debug, Clone)]
+struct CopilotCachedToken {
+    token: String,
+    expires_at: u64,
+    api_endpoint: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CopilotTokenResponse {
+    token: String,
+    expires_at: u64,
+    #[serde(default)]
+    endpoints: Option<CopilotEndpoints>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CopilotEndpoints {
+    #[serde(default)]
+    api: Option<String>,
+}
+
+impl CopilotTokenManager {
+    fn new(github_token: String) -> Self {
+        Self {
+            github_token,
+            http: reqwest::Client::new(),
+            cached: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Load the OAuth token from the Copilot config files on disk.
+    /// Checks `~/.config/github-copilot/apps.json` first, then `hosts.json`.
+    fn load_oauth_token_from_config() -> Result<String, ApiError> {
+        let home = home_dir().ok_or_else(|| {
+            ApiError::Auth("cannot determine home directory for Copilot config".to_string())
+        })?;
+
+        // Try apps.json first (newer format)
+        let apps_path = home.join(GITHUB_COPILOT_APPS_JSON);
+        if let Some(token) = read_copilot_config_token(&apps_path) {
+            return Ok(token);
+        }
+
+        // Fall back to hosts.json
+        let hosts_path = home.join(GITHUB_COPILOT_HOSTS_JSON);
+        if let Some(token) = read_copilot_config_token(&hosts_path) {
+            return Ok(token);
+        }
+
+        Err(ApiError::Auth(
+            "no GitHub Copilot OAuth token found; sign in to GitHub Copilot in VS Code first, \
+             or set GITHUB_COPILOT_TOKEN to your OAuth token"
+                .to_string(),
+        ))
+    }
+
+    async fn get_token(&self) -> Result<(String, String), ApiError> {
+        {
+            let cached = self.cached.lock().await;
+            if let Some(ref entry) = *cached {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                // Refresh 60s before expiry
+                if now + 60 < entry.expires_at {
+                    return Ok((entry.token.clone(), entry.api_endpoint.clone()));
+                }
+            }
+        }
+        self.refresh_token().await
+    }
+
+    async fn refresh_token(&self) -> Result<(String, String), ApiError> {
+        let response = self
+            .http
+            .get(GITHUB_COPILOT_TOKEN_URL)
+            .header("authorization", format!("token {}", self.github_token))
+            .header("user-agent", "claw-code/1.0")
+            .header("accept", "application/json")
+            .send()
+            .await
+            .map_err(ApiError::from)?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(ApiError::Auth(format!(
+                "failed to obtain Copilot session token (HTTP {status}): {body}"
+            )));
+        }
+
+        let token_response: CopilotTokenResponse = response
+            .json()
+            .await
+            .map_err(|e| ApiError::Auth(format!("failed to parse Copilot token response: {e}")))?;
+
+        let api_endpoint = token_response
+            .endpoints
+            .as_ref()
+            .and_then(|ep| ep.api.clone())
+            .unwrap_or_else(|| DEFAULT_GITHUB_COPILOT_BASE_URL.to_string());
+
+        let token = token_response.token.clone();
+        let mut cached = self.cached.lock().await;
+        *cached = Some(CopilotCachedToken {
+            token: token_response.token,
+            expires_at: token_response.expires_at,
+            api_endpoint: api_endpoint.clone(),
+        });
+        Ok((token, api_endpoint))
+    }
+}
+
+/// Read the `oauth_token` from a Copilot JSON config file.
+/// Both `apps.json` and `hosts.json` use the same shape:
+/// `{"github.com": {"oauth_token": "ghu_..."}}`.
+fn read_copilot_config_token(path: &std::path::Path) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    let obj = parsed.as_object()?;
+    // Try each key — could be "github.com", "github.com:443", etc.
+    for value in obj.values() {
+        if let Some(token) = value.get("oauth_token").and_then(|v| v.as_str()) {
+            if !token.is_empty() {
+                return Some(token.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenAiCompatConfig {
@@ -33,7 +187,11 @@ pub struct OpenAiCompatConfig {
 
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
-const GITHUB_COPILOT_ENV_VARS: &[&str] = &["GITHUB_COPILOT_API_KEY", "GITHUB_TOKEN"];
+const GITHUB_COPILOT_ENV_VARS: &[&str] = &[
+    "GITHUB_COPILOT_API_KEY",
+    "GITHUB_COPILOT_TOKEN",
+    "~/.config/github-copilot/apps.json",
+];
 
 impl OpenAiCompatConfig {
     #[must_use]
@@ -86,6 +244,7 @@ pub struct OpenAiCompatClient {
     max_retries: u32,
     initial_backoff: Duration,
     max_backoff: Duration,
+    copilot_token_manager: Option<CopilotTokenManager>,
 }
 
 impl OpenAiCompatClient {
@@ -94,42 +253,40 @@ impl OpenAiCompatClient {
     }
     #[must_use]
     pub fn new(api_key: impl Into<String>, config: OpenAiCompatConfig) -> Self {
-        // GitHub Copilot (models.github.ai) may redirect to Azure, which causes
-        // reqwest to strip the Authorization header on cross-origin redirects.
-        // Disable automatic redirects for providers that need this workaround.
-        let http = if config.provider_name == "GitHub Copilot" {
-            reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new())
+        let api_key = api_key.into();
+        let copilot_token_manager = if config.provider_name == "GitHub Copilot" {
+            Some(CopilotTokenManager::new(api_key.clone()))
         } else {
-            reqwest::Client::new()
+            None
         };
         Self {
-            http,
-            api_key: api_key.into(),
+            http: reqwest::Client::new(),
+            api_key,
             config,
             base_url: read_base_url(config),
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: DEFAULT_INITIAL_BACKOFF,
             max_backoff: DEFAULT_MAX_BACKOFF,
+            copilot_token_manager,
         }
     }
 
     pub fn from_env(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
-        let api_key = if let Some(key) = read_env_non_empty(config.api_key_env)? {
-            key
-        } else if config.provider_name == "GitHub Copilot" {
-            // Fall back to GITHUB_TOKEN when GITHUB_COPILOT_API_KEY is not set
-            if let Some(key) = read_env_non_empty("GITHUB_TOKEN")? {
-                key
-            } else {
-                return Err(ApiError::missing_credentials(
-                    config.provider_name,
-                    config.credential_env_vars(),
-                ));
-            }
-        } else {
+        if config.provider_name == "GitHub Copilot" {
+            // Resolution order for GitHub Copilot OAuth token:
+            // 1. GITHUB_COPILOT_TOKEN env var (explicit override)
+            // 2. ~/.config/github-copilot/apps.json (VS Code cached token)
+            // 3. ~/.config/github-copilot/hosts.json (legacy location)
+            let api_key = read_env_non_empty(config.api_key_env)?
+                .or_else(|| read_env_non_empty("GITHUB_COPILOT_TOKEN").ok().flatten())
+                .map_or_else(
+                    || CopilotTokenManager::load_oauth_token_from_config(),
+                    Ok,
+                )?;
+            return Ok(Self::new(api_key, config));
+        }
+
+        let Some(api_key) = read_env_non_empty(config.api_key_env)? else {
             return Err(ApiError::missing_credentials(
                 config.provider_name,
                 config.credential_env_vars(),
@@ -161,6 +318,11 @@ impl OpenAiCompatClient {
         &self,
         request: &MessageRequest,
     ) -> Result<MessageResponse, ApiError> {
+        // Copilot API only supports streaming; collect a streamed response.
+        if self.copilot_token_manager.is_some() {
+            let mut stream = self.stream_message(request).await?;
+            return collect_streamed_response(&mut stream).await;
+        }
         let request = MessageRequest {
             stream: false,
             ..request.clone()
@@ -229,38 +391,42 @@ impl OpenAiCompatClient {
         &self,
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
+        let mut body = build_chat_completion_request(request, self.config());
+
+        if let Some(ref manager) = self.copilot_token_manager {
+            // Exchange OAuth token for a short-lived Copilot session token.
+            // The token response also provides the correct API endpoint.
+            let (session_token, api_endpoint) = manager.get_token().await?;
+            let request_url = chat_completions_endpoint(&api_endpoint);
+
+            // Copilot API requires streaming — force it on.
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("stream".to_string(), serde_json::Value::Bool(true));
+            }
+
+            return self
+                .http
+                .post(&request_url)
+                .header("content-type", "application/json")
+                .header("editor-version", "vscode/1.99.0")
+                .header("copilot-integration-id", "vscode-chat")
+                .header("openai-intent", "conversation-panel")
+                .bearer_auth(&session_token)
+                .json(&body)
+                .send()
+                .await
+                .map_err(ApiError::from);
+        }
+
         let request_url = chat_completions_endpoint(&self.base_url);
-        let body = build_chat_completion_request(request, self.config());
-        let response = self
-            .http
+        self.http
             .post(&request_url)
             .header("content-type", "application/json")
             .bearer_auth(&self.api_key)
             .json(&body)
             .send()
             .await
-            .map_err(ApiError::from)?;
-
-        // If we get a redirect (3xx) with redirects disabled (GitHub Copilot),
-        // follow it manually while preserving the Authorization header.
-        if response.status().is_redirection() {
-            if let Some(location) = response.headers().get("location") {
-                let redirect_url = location
-                    .to_str()
-                    .map_err(|_| ApiError::InvalidSseFrame("invalid redirect location header"))?;
-                return self
-                    .http
-                    .post(redirect_url)
-                    .header("content-type", "application/json")
-                    .bearer_auth(&self.api_key)
-                    .json(&body)
-                    .send()
-                    .await
-                    .map_err(ApiError::from);
-            }
-        }
-
-        Ok(response)
+            .map_err(ApiError::from)
     }
 
     fn backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
@@ -337,6 +503,69 @@ impl MessageStream {
             }
         }
     }
+}
+
+/// Collect a full `MessageResponse` from a streaming `MessageStream`.
+/// Used for the Copilot provider which does not support non-streaming requests.
+async fn collect_streamed_response(stream: &mut MessageStream) -> Result<MessageResponse, ApiError> {
+    let mut response = MessageResponse {
+        id: String::new(),
+        kind: "message".to_string(),
+        role: "assistant".to_string(),
+        content: Vec::new(),
+        model: String::new(),
+        stop_reason: None,
+        stop_sequence: None,
+        usage: Usage {
+            input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            output_tokens: 0,
+        },
+        request_id: stream.request_id().map(ToOwned::to_owned),
+    };
+
+    let mut text_buf = String::new();
+    let mut tool_calls: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
+
+    while let Some(event) = stream.next_event().await? {
+        match event {
+            StreamEvent::MessageStart(start) => {
+                response.id = start.message.id;
+                response.model = start.message.model;
+            }
+            StreamEvent::ContentBlockStart(start) => match start.content_block {
+                OutputContentBlock::ToolUse { id, name, .. } => {
+                    tool_calls.insert(start.index, (id, name, String::new()));
+                }
+                _ => {}
+            },
+            StreamEvent::ContentBlockDelta(delta) => match delta.delta {
+                ContentBlockDelta::TextDelta { text } => text_buf.push_str(&text),
+                ContentBlockDelta::InputJsonDelta { partial_json } => {
+                    if let Some((_, _, args)) = tool_calls.get_mut(&delta.index) {
+                        args.push_str(&partial_json);
+                    }
+                }
+                _ => {}
+            },
+            StreamEvent::MessageDelta(delta) => {
+                response.stop_reason = delta.delta.stop_reason;
+                response.usage = delta.usage;
+            }
+            _ => {}
+        }
+    }
+
+    if !text_buf.is_empty() {
+        response.content.push(OutputContentBlock::Text { text: text_buf });
+    }
+    for (_, (id, name, arguments)) in tool_calls {
+        let input = serde_json::from_str(&arguments).unwrap_or_else(|_| json!({ "raw": arguments }));
+        response.content.push(OutputContentBlock::ToolUse { id, name, input });
+    }
+
+    Ok(response)
 }
 
 #[derive(Debug, Default)]
