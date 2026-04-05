@@ -94,8 +94,19 @@ impl OpenAiCompatClient {
     }
     #[must_use]
     pub fn new(api_key: impl Into<String>, config: OpenAiCompatConfig) -> Self {
+        // GitHub Copilot (models.github.ai) may redirect to Azure, which causes
+        // reqwest to strip the Authorization header on cross-origin redirects.
+        // Disable automatic redirects for providers that need this workaround.
+        let http = if config.provider_name == "GitHub Copilot" {
+            reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        } else {
+            reqwest::Client::new()
+        };
         Self {
-            http: reqwest::Client::new(),
+            http,
             api_key: api_key.into(),
             config,
             base_url: read_base_url(config),
@@ -219,14 +230,37 @@ impl OpenAiCompatClient {
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let request_url = chat_completions_endpoint(&self.base_url);
-        self.http
+        let body = build_chat_completion_request(request, self.config());
+        let response = self
+            .http
             .post(&request_url)
             .header("content-type", "application/json")
             .bearer_auth(&self.api_key)
-            .json(&build_chat_completion_request(request, self.config()))
+            .json(&body)
             .send()
             .await
-            .map_err(ApiError::from)
+            .map_err(ApiError::from)?;
+
+        // If we get a redirect (3xx) with redirects disabled (GitHub Copilot),
+        // follow it manually while preserving the Authorization header.
+        if response.status().is_redirection() {
+            if let Some(location) = response.headers().get("location") {
+                let redirect_url = location
+                    .to_str()
+                    .map_err(|_| ApiError::InvalidSseFrame("invalid redirect location header"))?;
+                return self
+                    .http
+                    .post(redirect_url)
+                    .header("content-type", "application/json")
+                    .bearer_auth(&self.api_key)
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(ApiError::from);
+            }
+        }
+
+        Ok(response)
     }
 
     fn backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
