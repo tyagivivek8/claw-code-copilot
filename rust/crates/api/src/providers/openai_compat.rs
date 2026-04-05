@@ -16,6 +16,7 @@ use super::{preflight_message_request, Provider, ProviderFuture};
 
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+pub const DEFAULT_GITHUB_COPILOT_BASE_URL: &str = "https://api.githubcopilot.com";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
@@ -32,6 +33,7 @@ pub struct OpenAiCompatConfig {
 
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
+const GITHUB_COPILOT_ENV_VARS: &[&str] = &["GITHUB_COPILOT_API_KEY", "GITHUB_TOKEN"];
 
 impl OpenAiCompatConfig {
     #[must_use]
@@ -53,11 +55,23 @@ impl OpenAiCompatConfig {
             default_base_url: DEFAULT_OPENAI_BASE_URL,
         }
     }
+
+    #[must_use]
+    pub const fn github_copilot() -> Self {
+        Self {
+            provider_name: "GitHub Copilot",
+            api_key_env: "GITHUB_COPILOT_API_KEY",
+            base_url_env: "GITHUB_COPILOT_BASE_URL",
+            default_base_url: DEFAULT_GITHUB_COPILOT_BASE_URL,
+        }
+    }
+
     #[must_use]
     pub fn credential_env_vars(self) -> &'static [&'static str] {
         match self.provider_name {
             "xAI" => XAI_ENV_VARS,
             "OpenAI" => OPENAI_ENV_VARS,
+            "GitHub Copilot" => GITHUB_COPILOT_ENV_VARS,
             _ => &[],
         }
     }
@@ -92,7 +106,19 @@ impl OpenAiCompatClient {
     }
 
     pub fn from_env(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
-        let Some(api_key) = read_env_non_empty(config.api_key_env)? else {
+        let api_key = if let Some(key) = read_env_non_empty(config.api_key_env)? {
+            key
+        } else if config.provider_name == "GitHub Copilot" {
+            // Fall back to GITHUB_TOKEN when GITHUB_COPILOT_API_KEY is not set
+            if let Some(key) = read_env_non_empty("GITHUB_TOKEN")? {
+                key
+            } else {
+                return Err(ApiError::missing_credentials(
+                    config.provider_name,
+                    config.credential_env_vars(),
+                ));
+            }
+        } else {
             return Err(ApiError::missing_credentials(
                 config.provider_name,
                 config.credential_env_vars(),
@@ -641,6 +667,7 @@ struct ErrorBody {
 }
 
 fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatConfig) -> Value {
+    let resolved_model = super::resolve_model_alias(&request.model);
     let mut messages = Vec::new();
     if let Some(system) = request.system.as_ref().filter(|value| !value.is_empty()) {
         messages.push(json!({
@@ -653,7 +680,7 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
     }
 
     let mut payload = json!({
-        "model": request.model,
+        "model": resolved_model,
         "max_tokens": request.max_tokens,
         "messages": messages,
         "stream": request.stream,
@@ -761,7 +788,7 @@ fn openai_tool_choice(tool_choice: &ToolChoice) -> Value {
 }
 
 fn should_request_stream_usage(config: OpenAiCompatConfig) -> bool {
-    matches!(config.provider_name, "OpenAI")
+    matches!(config.provider_name, "OpenAI" | "GitHub Copilot")
 }
 
 fn normalize_response(

@@ -32,6 +32,7 @@ pub enum ProviderKind {
     Anthropic,
     Xai,
     OpenAi,
+    GithubCopilot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +122,33 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
         },
     ),
+    (
+        "copilot-opus",
+        ProviderMetadata {
+            provider: ProviderKind::GithubCopilot,
+            auth_env: "GITHUB_COPILOT_API_KEY",
+            base_url_env: "GITHUB_COPILOT_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_GITHUB_COPILOT_BASE_URL,
+        },
+    ),
+    (
+        "copilot-sonnet",
+        ProviderMetadata {
+            provider: ProviderKind::GithubCopilot,
+            auth_env: "GITHUB_COPILOT_API_KEY",
+            base_url_env: "GITHUB_COPILOT_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_GITHUB_COPILOT_BASE_URL,
+        },
+    ),
+    (
+        "copilot-haiku",
+        ProviderMetadata {
+            provider: ProviderKind::GithubCopilot,
+            auth_env: "GITHUB_COPILOT_API_KEY",
+            base_url_env: "GITHUB_COPILOT_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_GITHUB_COPILOT_BASE_URL,
+        },
+    ),
 ];
 
 #[must_use]
@@ -144,6 +172,12 @@ pub fn resolve_model_alias(model: &str) -> String {
                     _ => trimmed,
                 },
                 ProviderKind::OpenAi => trimmed,
+                ProviderKind::GithubCopilot => match *alias {
+                    "copilot-opus" => "claude-opus-4-6",
+                    "copilot-sonnet" => "claude-sonnet-4-6",
+                    "copilot-haiku" => "claude-haiku-4-5-20251213",
+                    _ => trimmed,
+                },
             })
         })
         .map_or_else(|| trimmed.to_string(), ToOwned::to_owned)
@@ -151,6 +185,13 @@ pub fn resolve_model_alias(model: &str) -> String {
 
 #[must_use]
 pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
+    let lower = model.trim().to_ascii_lowercase();
+    // Check explicit registry entries first (e.g. copilot-opus) before
+    // falling back to prefix-based detection, so provider-specific aliases
+    // are not misrouted by their resolved canonical model name.
+    if let Some((_, metadata)) = MODEL_REGISTRY.iter().find(|(alias, _)| *alias == lower) {
+        return Some(*metadata);
+    }
     let canonical = resolve_model_alias(model);
     if canonical.starts_with("claude") {
         return Some(ProviderMetadata {
@@ -184,6 +225,11 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
     }
     if openai_compat::has_api_key("XAI_API_KEY") {
         return ProviderKind::Xai;
+    }
+    if openai_compat::has_api_key("GITHUB_COPILOT_API_KEY")
+        || openai_compat::has_api_key("GITHUB_TOKEN")
+    {
+        return ProviderKind::GithubCopilot;
     }
     ProviderKind::Anthropic
 }
