@@ -23,8 +23,9 @@ impl ProviderClient {
         model: &str,
         anthropic_auth: Option<AuthSource>,
     ) -> Result<Self, ApiError> {
-        let resolved_model = providers::resolve_model_alias(model);
-        match providers::detect_provider_kind(&resolved_model) {
+        // Detect provider from the ORIGINAL alias (e.g. "copilot-opus") before
+        // resolving it, so provider-specific prefixes are not lost.
+        match providers::detect_provider_kind(model) {
             ProviderKind::Anthropic => Ok(Self::Anthropic(match anthropic_auth {
                 Some(auth) => AnthropicClient::from_auth(auth),
                 None => AnthropicClient::from_env()?,
