@@ -61,10 +61,10 @@ struct CopilotEndpoints {
 }
 
 impl CopilotTokenManager {
-    fn new(github_token: String) -> Self {
+    fn new(github_token: String, http: reqwest::Client) -> Self {
         Self {
             github_token,
-            http: reqwest::Client::new(),
+            http,
             cached: Arc::new(Mutex::new(None)),
         }
     }
@@ -121,7 +121,11 @@ impl CopilotTokenManager {
             .header("accept", "application/json")
             .send()
             .await
-            .map_err(ApiError::from)?;
+            .map_err(|e| {
+                ApiError::Auth(format!(
+                    "failed to reach Copilot token endpoint ({GITHUB_COPILOT_TOKEN_URL}): {e}"
+                ))
+            })?;
 
         let status = response.status();
         if !status.is_success() {
@@ -254,13 +258,14 @@ impl OpenAiCompatClient {
     #[must_use]
     pub fn new(api_key: impl Into<String>, config: OpenAiCompatConfig) -> Self {
         let api_key = api_key.into();
+        let http = reqwest::Client::new();
         let copilot_token_manager = if config.provider_name == "GitHub Copilot" {
-            Some(CopilotTokenManager::new(api_key.clone()))
+            Some(CopilotTokenManager::new(api_key.clone(), http.clone()))
         } else {
             None
         };
         Self {
-            http: reqwest::Client::new(),
+            http,
             api_key,
             config,
             base_url: read_base_url(config),
