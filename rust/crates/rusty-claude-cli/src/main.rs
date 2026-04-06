@@ -4892,10 +4892,31 @@ impl ApiClient for AnthropicRuntimeClient {
                             if let Some(progress_reporter) = &self.progress_reporter {
                                 progress_reporter.mark_tool_phase(&name, &input);
                             }
-                            // Display tool call now that input is fully accumulated
-                            writeln!(out, "\n{}", format_tool_call_start(&name, &input))
-                                .and_then(|()| out.flush())
-                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            // Display tool call now that input is fully accumulated.
+                            // SendUserMessage carries the model's actual response
+                            // text — render it through the markdown pipeline
+                            // instead of a tool-call box.
+                            if matches!(name.as_str(), "SendUserMessage" | "Brief" | "AskUserQuestion") {
+                                if let Some(msg) = serde_json::from_str::<serde_json::Value>(&input)
+                                    .ok()
+                                    .and_then(|v| v.get("message").or_else(|| v.get("question")).and_then(|m| m.as_str().map(ToOwned::to_owned)))
+                                {
+                                    if !first_text_emitted {
+                                        first_text_emitted = true;
+                                        writeln!(out, "\x1b[2;38;5;245m───── assistant ─────────────────────────────\x1b[0m")
+                                            .and_then(|()| out.flush())
+                                            .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                    }
+                                    let rendered = renderer.markdown_to_ansi(&msg);
+                                    writeln!(out, "{rendered}")
+                                        .and_then(|()| out.flush())
+                                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                }
+                            } else {
+                                writeln!(out, "\n{}", format_tool_call_start(&name, &input))
+                                    .and_then(|()| out.flush())
+                                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            }
                             events.push(AssistantEvent::ToolUse { id, name, input });
                         }
                     }
