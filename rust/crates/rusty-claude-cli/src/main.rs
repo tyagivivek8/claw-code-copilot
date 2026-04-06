@@ -1730,6 +1730,7 @@ struct SessionHandle {
 #[derive(Debug, Clone)]
 struct ManagedSessionSummary {
     id: String,
+    title: Option<String>,
     path: PathBuf,
     modified_epoch_millis: u128,
     message_count: usize,
@@ -3178,7 +3179,7 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_millis())
             .unwrap_or_default();
-        let (id, message_count, parent_session_id, branch_name) =
+        let (id, title, message_count, parent_session_id, branch_name) =
             match Session::load_from_path(&path) {
                 Ok(session) => {
                     let parent_session_id = session
@@ -3191,6 +3192,7 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
                         .and_then(|fork| fork.branch_name.clone());
                     (
                         session.session_id,
+                        session.title,
                         session.messages.len(),
                         parent_session_id,
                         branch_name,
@@ -3201,6 +3203,7 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
                         .and_then(|value| value.to_str())
                         .unwrap_or("unknown")
                         .to_string(),
+                    None,
                     0,
                     None,
                     None,
@@ -3208,6 +3211,7 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
             };
         sessions.push(ManagedSessionSummary {
             id,
+            title,
             path,
             modified_epoch_millis,
             message_count,
@@ -3255,10 +3259,14 @@ fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::e
     }
     for session in sessions {
         let marker = if session.id == active_session_id {
-            "● current"
+            "\x1b[32m● current\x1b[0m"
         } else {
-            "○ saved"
+            "\x1b[38;5;245m○ saved\x1b[0m"
         };
+        let display_name = session
+            .title
+            .as_deref()
+            .unwrap_or(&session.id);
         let lineage = match (
             session.branch_name.as_deref(),
             session.parent_session_id.as_deref(),
@@ -3270,13 +3278,10 @@ fn render_session_list(active_session_id: &str) -> Result<String, Box<dyn std::e
             (Some(branch_name), None) => format!(" branch={branch_name}"),
             (None, None) => String::new(),
         };
+        let modified = format_session_modified_age(session.modified_epoch_millis);
         lines.push(format!(
-            "  {id:<20} {marker:<10} msgs={msgs:<4} modified={modified}{lineage} path={path}",
-            id = session.id,
+            "  {marker}  \x1b[1m{display_name}\x1b[0m  \x1b[38;5;245m{msgs} msgs · {modified}{lineage}\x1b[0m",
             msgs = session.message_count,
-            modified = format_session_modified_age(session.modified_epoch_millis),
-            lineage = lineage,
-            path = session.path.display(),
         ));
     }
     Ok(lines.join("\n"))

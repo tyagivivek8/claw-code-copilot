@@ -75,6 +75,7 @@ struct SessionPersistence {
 pub struct Session {
     pub version: u32,
     pub session_id: String,
+    pub title: Option<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub messages: Vec<ConversationMessage>,
@@ -87,6 +88,7 @@ impl PartialEq for Session {
     fn eq(&self, other: &Self) -> bool {
         self.version == other.version
             && self.session_id == other.session_id
+            && self.title == other.title
             && self.created_at_ms == other.created_at_ms
             && self.updated_at_ms == other.updated_at_ms
             && self.messages == other.messages
@@ -136,6 +138,7 @@ impl Session {
         Self {
             version: SESSION_VERSION,
             session_id: generate_session_id(),
+            title: None,
             created_at_ms: now,
             updated_at_ms: now,
             messages: Vec::new(),
@@ -183,6 +186,10 @@ impl Session {
 
     pub fn push_message(&mut self, message: ConversationMessage) -> Result<(), SessionError> {
         self.touch();
+        // Auto-derive title from the first user message when not yet set.
+        if self.title.is_none() && message.role == MessageRole::User {
+            self.title = derive_session_title(&message);
+        }
         self.messages.push(message);
         let persist_result = {
             let message_ref = self.messages.last().ok_or_else(|| {
@@ -217,6 +224,7 @@ impl Session {
         Self {
             version: self.version,
             session_id: generate_session_id(),
+            title: self.title.clone(),
             created_at_ms: now,
             updated_at_ms: now,
             messages: self.messages.clone(),
@@ -239,6 +247,9 @@ impl Session {
             "session_id".to_string(),
             JsonValue::String(self.session_id.clone()),
         );
+        if let Some(title) = &self.title {
+            object.insert("title".to_string(), JsonValue::String(title.clone()));
+        }
         object.insert(
             "created_at_ms".to_string(),
             JsonValue::Number(i64_from_u64(self.created_at_ms, "created_at_ms")?),
@@ -287,6 +298,10 @@ impl Session {
             .get("session_id")
             .and_then(JsonValue::as_str)
             .map_or_else(generate_session_id, ToOwned::to_owned);
+        let title = object
+            .get("title")
+            .and_then(JsonValue::as_str)
+            .map(ToOwned::to_owned);
         let created_at_ms = object
             .get("created_at_ms")
             .map(|value| required_u64_from_value(value, "created_at_ms"))
@@ -305,6 +320,7 @@ impl Session {
         Ok(Self {
             version,
             session_id,
+            title,
             created_at_ms,
             updated_at_ms,
             messages,
@@ -317,6 +333,7 @@ impl Session {
     fn from_jsonl(contents: &str) -> Result<Self, SessionError> {
         let mut version = SESSION_VERSION;
         let mut session_id = None;
+        let mut title = None;
         let mut created_at_ms = None;
         let mut updated_at_ms = None;
         let mut messages = Vec::new();
@@ -353,6 +370,10 @@ impl Session {
                 "session_meta" => {
                     version = required_u32(object, "version")?;
                     session_id = Some(required_string(object, "session_id")?);
+                    title = object
+                        .get("title")
+                        .and_then(JsonValue::as_str)
+                        .map(ToOwned::to_owned);
                     created_at_ms = Some(required_u64(object, "created_at_ms")?);
                     updated_at_ms = Some(required_u64(object, "updated_at_ms")?);
                     fork = object.get("fork").map(SessionFork::from_json).transpose()?;
@@ -384,6 +405,7 @@ impl Session {
         Ok(Self {
             version,
             session_id: session_id.unwrap_or_else(generate_session_id),
+            title,
             created_at_ms: created_at_ms.unwrap_or(now),
             updated_at_ms: updated_at_ms.unwrap_or(created_at_ms.unwrap_or(now)),
             messages,
@@ -438,6 +460,9 @@ impl Session {
             "session_id".to_string(),
             JsonValue::String(self.session_id.clone()),
         );
+        if let Some(title) = &self.title {
+            object.insert("title".to_string(), JsonValue::String(title.clone()));
+        }
         object.insert(
             "created_at_ms".to_string(),
             JsonValue::Number(i64_from_u64(self.created_at_ms, "created_at_ms")?),
@@ -847,6 +872,30 @@ fn generate_session_id() -> String {
     let millis = current_time_millis();
     let counter = SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("session-{millis}-{counter}")
+}
+
+/// Derives a short, human-readable title from the first text block of a
+/// user message.  Takes the first line, keeps up to 6 words, and truncates
+/// to 60 characters.  Returns `None` when the message has no text.
+fn derive_session_title(message: &ConversationMessage) -> Option<String> {
+    let text = message.blocks.iter().find_map(|block| match block {
+        ContentBlock::Text { text } if !text.trim().is_empty() => Some(text.as_str()),
+        _ => None,
+    })?;
+    let first_line = text.lines().next().unwrap_or(text).trim();
+    let title: String = first_line
+        .split_whitespace()
+        .take(6)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if title.is_empty() {
+        return None;
+    }
+    if title.len() > 60 {
+        Some(format!("{}...", &title[..57]))
+    } else {
+        Some(title)
+    }
 }
 
 fn write_atomic(path: &Path, contents: &str) -> Result<(), SessionError> {
