@@ -506,6 +506,29 @@ fn format_unknown_direct_slash_command(name: &str) -> String {
     message
 }
 
+fn short_model_label(model: &str) -> &str {
+    if model.contains("opus") {
+        "opus"
+    } else if model.contains("sonnet") {
+        "sonnet"
+    } else if model.contains("haiku") {
+        "haiku"
+    } else if model.contains("grok") {
+        "grok"
+    } else {
+        model
+    }
+}
+
+fn colored_prompt(model: &str) -> String {
+    let label = short_model_label(model);
+    // \x01 and \x02 are rustyline markers for invisible escape sequences
+    // so cursor positioning works correctly with ANSI colors.
+    format!(
+        "\x01\x1b[2;38;5;245m\x02{label} \x01\x1b[0;1;36m\x02>\x01\x1b[0m\x02 "
+    )
+}
+
 fn format_unknown_slash_command(name: &str) -> String {
     let mut message = format!("Unknown slash command: /{name}");
     if let Some(suggestions) = render_suggestion_line("Did you mean", &suggest_slash_commands(name))
@@ -1650,12 +1673,15 @@ fn run_repl(
     permission_mode: PermissionMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
-    let mut editor =
-        input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
+    let mut editor = input::LineEditor::new(
+        colored_prompt(&cli.model),
+        cli.repl_completion_candidates().unwrap_or_default(),
+    );
     println!("{}", cli.startup_banner());
 
     loop {
         editor.set_completions(cli.repl_completion_candidates().unwrap_or_default());
+        editor.set_prompt(colored_prompt(&cli.model));
         match editor.read_line()? {
             input::ReadOutcome::Submit(input) => {
                 let trimmed = input.trim().to_string();
@@ -4784,6 +4810,9 @@ impl ApiClient for AnthropicRuntimeClient {
             let mut events = Vec::new();
             let mut pending_tool: Option<(String, String, String)> = None;
             let mut saw_stop = false;
+            let mut first_text_emitted = false;
+            let show_thinking = env::var("CLAW_SHOW_THINKING").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+            let mut in_thinking_block = false;
 
             while let Some(event) = stream
                 .next_event()
@@ -4797,6 +4826,12 @@ impl ApiClient for AnthropicRuntimeClient {
                         }
                     }
                     ApiStreamEvent::ContentBlockStart(start) => {
+                        if show_thinking && matches!(start.content_block, OutputContentBlock::Thinking { .. }) {
+                            in_thinking_block = true;
+                            write!(out, "\n\x1b[2;38;5;245m💭 thinking…\n\x1b[0m")
+                                .and_then(|()| out.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        }
                         push_output_block(
                             start.content_block,
                             out,
@@ -4808,6 +4843,12 @@ impl ApiClient for AnthropicRuntimeClient {
                     ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
                         ContentBlockDelta::TextDelta { text } => {
                             if !text.is_empty() {
+                                if !first_text_emitted {
+                                    first_text_emitted = true;
+                                    writeln!(out, "\x1b[2;38;5;245m───── assistant ─────────────────────────────\x1b[0m")
+                                        .and_then(|()| out.flush())
+                                        .map_err(|error| RuntimeError::new(error.to_string()))?;
+                                }
                                 if let Some(progress_reporter) = &self.progress_reporter {
                                     progress_reporter.mark_text_phase(&text);
                                 }
@@ -4824,10 +4865,22 @@ impl ApiClient for AnthropicRuntimeClient {
                                 input.push_str(&partial_json);
                             }
                         }
-                        ContentBlockDelta::ThinkingDelta { .. }
-                        | ContentBlockDelta::SignatureDelta { .. } => {}
+                        ContentBlockDelta::ThinkingDelta { thinking } => {
+                            if show_thinking && !thinking.is_empty() {
+                                write!(out, "\x1b[2;38;5;245m{thinking}\x1b[0m")
+                                    .and_then(|()| out.flush())
+                                    .map_err(|error| RuntimeError::new(error.to_string()))?;
+                            }
+                        }
+                        ContentBlockDelta::SignatureDelta { .. } => {}
                     },
                     ApiStreamEvent::ContentBlockStop(_) => {
+                        if in_thinking_block {
+                            in_thinking_block = false;
+                            writeln!(out)
+                                .and_then(|()| out.flush())
+                                .map_err(|error| RuntimeError::new(error.to_string()))?;
+                        }
                         if let Some(rendered) = markdown_stream.flush(&renderer) {
                             write!(out, "{rendered}")
                                 .and_then(|()| out.flush())
