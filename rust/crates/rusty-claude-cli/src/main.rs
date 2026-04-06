@@ -2767,7 +2767,24 @@ impl LiveCli {
             return Ok(false);
         };
 
-        let handle = resolve_session_reference(&session_ref)?;
+        // When "latest" is used from the REPL, skip the current session —
+        // otherwise it always resolves to the session we just created.
+        let handle = if SESSION_REFERENCE_ALIASES
+            .iter()
+            .any(|alias| session_ref.eq_ignore_ascii_case(alias))
+        {
+            let sessions = list_managed_sessions()?;
+            let latest = sessions
+                .into_iter()
+                .find(|s| s.id != self.session.id)
+                .ok_or_else(|| format_no_managed_sessions())?;
+            SessionHandle {
+                id: latest.id,
+                path: latest.path,
+            }
+        } else {
+            resolve_session_reference(&session_ref)?
+        };
         let session = Session::load_from_path(&handle.path)?;
         let message_count = session.messages.len();
         let session_id = session.session_id.clone();
