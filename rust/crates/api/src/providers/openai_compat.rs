@@ -988,20 +988,20 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                     InputContentBlock::ToolResult { .. } => {}
                 }
             }
-            if text.is_empty() && tool_calls.is_empty() {
-                Vec::new()
-            } else {
-                let mut msg = json!({
-                    "role": "assistant",
-                    "content": if text.is_empty() { Value::Null } else { Value::String(text) },
-                });
-                // OpenAI API rejects empty tool_calls arrays — only include
-                // the field when there are actual tool calls.
-                if !tool_calls.is_empty() {
-                    msg["tool_calls"] = Value::Array(tool_calls);
-                }
-                vec![msg]
+            // Always emit assistant messages — even empty ones — to
+            // preserve the conversation structure the OpenAI API expects
+            // (tool result must be followed by an assistant message before
+            // the next user message).
+            let mut msg = json!({
+                "role": "assistant",
+                "content": if text.is_empty() { Value::String(String::new()) } else { Value::String(text) },
+            });
+            // OpenAI API rejects empty tool_calls arrays — only include
+            // the field when there are actual tool calls.
+            if !tool_calls.is_empty() {
+                msg["tool_calls"] = Value::Array(tool_calls);
             }
+            vec![msg]
         }
         _ => message
             .content
