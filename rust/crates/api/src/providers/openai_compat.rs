@@ -991,11 +991,16 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
             if text.is_empty() && tool_calls.is_empty() {
                 Vec::new()
             } else {
-                vec![json!({
+                let mut msg = json!({
                     "role": "assistant",
-                    "content": (!text.is_empty()).then_some(text),
-                    "tool_calls": tool_calls,
-                })]
+                    "content": if text.is_empty() { Value::Null } else { Value::String(text) },
+                });
+                // OpenAI API rejects empty tool_calls arrays — only include
+                // the field when there are actual tool calls.
+                if !tool_calls.is_empty() {
+                    msg["tool_calls"] = Value::Array(tool_calls);
+                }
+                vec![msg]
             }
         }
         _ => message
@@ -1009,12 +1014,11 @@ fn translate_message(message: &InputMessage) -> Vec<Value> {
                 InputContentBlock::ToolResult {
                     tool_use_id,
                     content,
-                    is_error,
+                    ..
                 } => Some(json!({
                     "role": "tool",
                     "tool_call_id": tool_use_id,
                     "content": flatten_tool_result_content(content),
-                    "is_error": is_error,
                 })),
                 InputContentBlock::ToolUse { .. } => None,
             })
