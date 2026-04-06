@@ -704,7 +704,12 @@ fn build_assistant_message(
         ));
     }
     if blocks.is_empty() {
-        return Err(RuntimeError::new("assistant stream produced no content"));
+        // Some providers (e.g. GitHub Copilot) may return an empty response
+        // after a tool-use turn.  Treat this as a no-op text block so the
+        // agentic loop can terminate gracefully instead of crashing.
+        blocks.push(ContentBlock::Text {
+            text: String::new(),
+        });
     }
 
     Ok((
@@ -1588,18 +1593,17 @@ mod tests {
     }
 
     #[test]
-    fn build_assistant_message_requires_content() {
+    fn build_assistant_message_tolerates_empty_content() {
         // given
         let events = vec![AssistantEvent::MessageStop];
 
-        // when
-        let error =
-            build_assistant_message(events).expect_err("assistant messages should require content");
+        // when — empty content is tolerated with a synthetic empty text block
+        let (message, _, _) =
+            build_assistant_message(events).expect("empty content should be tolerated");
 
         // then
-        assert!(error
-            .to_string()
-            .contains("assistant stream produced no content"));
+        assert_eq!(message.blocks.len(), 1);
+        assert!(matches!(&message.blocks[0], ContentBlock::Text { text } if text.is_empty()));
     }
 
     #[test]

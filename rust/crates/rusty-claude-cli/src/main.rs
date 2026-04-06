@@ -1706,7 +1706,9 @@ fn run_repl(
                     }
                 }
                 editor.push_history(input);
-                cli.run_turn(&trimmed)?;
+                if let Err(error) = cli.run_turn(&trimmed) {
+                    eprintln!("\x1b[1;31merror:\x1b[0m {error}");
+                }
             }
             input::ReadOutcome::Cancel => {}
             input::ReadOutcome::Exit => {
@@ -5142,6 +5144,14 @@ fn format_tool_call_start(name: &str, input: &str) -> String {
             .and_then(|value| value.as_str())
             .unwrap_or("?")
             .to_string(),
+        "SendUserMessage" | "Brief" | "AskUserQuestion" => {
+            let message = parsed
+                .get("message")
+                .or_else(|| parsed.get("question"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            format!("\x1b[2m💬 {message}\x1b[0m")
+        }
         _ => summarize_tool_payload(input),
     };
 
@@ -5175,6 +5185,11 @@ fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
         "edit_file" | "Edit" => format_edit_result(icon, &parsed),
         "glob_search" | "Glob" => format_glob_result(icon, &parsed),
         "grep_search" | "Grep" => format_grep_result(icon, &parsed),
+        "SendUserMessage" | "Brief" | "AskUserQuestion" => {
+            // The message content is already displayed as the tool call detail;
+            // just show a compact success indicator.
+            format!("{icon} \x1b[38;5;245m{name}\x1b[0m")
+        }
         _ => format_generic_tool_result(icon, name, &parsed),
     }
 }
